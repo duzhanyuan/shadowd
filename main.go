@@ -1,7 +1,6 @@
 package main
 
 import (
-	"fmt"
 	"log"
 	"math/rand"
 	"net"
@@ -10,6 +9,7 @@ import (
 	"time"
 
 	"github.com/docopt/docopt-go"
+	"github.com/seletskiy/hierr"
 )
 
 var version = `2.2`
@@ -44,6 +44,7 @@ Options:
                             [default: /var/shadowd/cert/].
   -k --keys <dir>          Use specified dir for reading public SSH keys.
                             [default: /var/shadowd/ssh/].
+  -c --config <path>       Use specified configuration file.
   -q --quiet               Quiet mode, be less chatty.
   --help                   Show this screen.
   --version                Show program version.
@@ -58,16 +59,76 @@ func main() {
 		replaceDefaults(usage), nil, true, "shadowd "+version, false,
 	)
 
-	var err error
+	hashTTL, err := time.ParseDuration(args["--ttl"].(string))
+	if err != nil {
+		hierr.Fatalf(
+			err, "can't parse ttl time",
+		)
+	}
+
+	var backend Backend
+	if path, ok := args["--config"].(string); ok {
+		config, err := getConfig(path)
+		if err != nil {
+			hierr.Fatalf(
+				err, "can't parse configuration file",
+			)
+		}
+
+		if config.Backend.Use == "mongodb" {
+			backend, err = newMongoDB(config.Backend.Path)
+			if err != nil {
+				hierr.Fatalf(
+					err, "can't initialize mongodb backend",
+				)
+			}
+		}
+	}
+
+	if backend == nil {
+		backend = &filesystem{
+			hashTablesDir: args["--tables"].(string),
+			sshKeysDir:    args["--keys"].(string),
+			hashTTL:       hashTTL,
+		}
+	}
+
+	err = backend.Init()
+	if err != nil {
+		hierr.Fatalf(
+			err, "can't initialize shadowd backend",
+		)
+	}
+
 	switch {
 	case args["--generate"]:
-		err = handleTableGenerate(args)
+		err = handleTableGenerate(
+			backend,
+			args["<token>"].(string),
+			args["--length"].(string),
+			args["--algorithm"].(string),
+			args["--quiet"].(bool),
+		)
+
 	case args["--key"]:
-		err = handleSSHKeyAppend(args)
+		err = handleSSHKeyAppend(
+			backend,
+			args["<token>"].(string),
+			args["--truncate"].(bool),
+		)
+
 	case args["--certificate"]:
-		err = handleCertificateGenerate(args)
+		err = handleCertificateGenerate(
+			args["--certs"].(string),
+			args["--bytes"].(string),
+			args["--till"].(string),
+			args["--host"].([]string),
+			args["--address"].([]string),
+		)
 	default:
-		err = handleListen(args)
+		err = handleListen(
+			backend, hashTTL, args,
+		)
 	}
 
 	if err != nil {
@@ -119,7 +180,7 @@ func getLocalIpAddress() string {
 		for _, address := range adresses {
 			switch ipAddress := address.(type) {
 			case *net.IPNet:
-				ipString := fmt.Sprint(ipAddress.IP)
+				ipString := ipAddress.IP.String()
 				if strings.HasPrefix(ipString, "127.") || ipString == "::1" {
 					continue
 				} else {
